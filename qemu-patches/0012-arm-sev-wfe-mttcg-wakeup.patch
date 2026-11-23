@@ -1,0 +1,57 @@
+From: XZ-Mods <local>
+Subject: [PATCH] target/arm: make SEV/WFE wakeups MTTCG-safe and targeted
+
+In QEMU 11.1, an ARM SEV issued by one MTTCG vCPU can race a second
+vCPU's transition into the BQL-protected halt-condition wait after WFE.
+The event bit is set, but the condvar broadcast can occur before the target
+actually waits; the target then sleeps until an unrelated wakeup.
+
+Serialize the event-bit update and the wakeup with the BQL, matching the
+upstream lost-WFE-wakeup correction.  This is required by 32-bit Linux SMP
+spinlocks, which use WFE while acquiring and DSB; SEV while releasing.
+
+Do not host-kick vCPUs that are running.  SEV is a sticky event, so a running
+vCPU consumes it at its next WFE without a thread exit.  Only an already
+halted WFE vCPU needs the condition broadcast.  WFI is deliberately excluded:
+SEV wakes WFE, not WFI.
+
+--- a/target/arm/tcg/op_helper.c
++++ b/target/arm/tcg/op_helper.c
+@@ -475,11 +475,36 @@
+ void HELPER(sev)(CPUARMState *env)
+ {
+     CPUState *cs = env_cpu(env);
++
++    /*
++     * A SEV makes a halted WFE CPU runnable by changing the state tested
++     * by arm_cpu_has_work().  Serialize that change and the wakeup with the
++     * BQL: otherwise the target can test its old state, miss a condvar
++     * broadcast, and sleep after the event has been posted.
++     *
++     * This is the upstream ARM MTTCG lost-WFE-wakeup fix, backported to the
++     * 11.1 helper signature used by this tree.
++     */
++    BQL_LOCK_GUARD();
+     CPU_FOREACH(cs) {
+         ARMCPU *target_cpu = ARM_CPU(cs);
++
+         target_cpu->env.event_register = true;
+-        if (!qemu_cpu_is_self(cs)) {
++
++        /*
++         * SEV is a sticky event, not an interrupt.  A running vCPU will
++         * consume this at its next WFE without needing a host-thread exit.
++         * Only a vCPU that is already sleeping in WFE needs its halt
++         * condition broadcast.  Besides avoiding unnecessary MTTCG kicks on
++         * every guest spin_unlock(), this deliberately does not wake WFI:
++         * ARM specifies that SEV wakes WFE only.
++         *
++         * The BQL above closes the transition into qemu_cond_wait(), so this
++         * test and the conditional broadcast cannot lose an event.
++         */
++        if (!qemu_cpu_is_self(cs) &&
++            qatomic_read(&target_cpu->env.halt_reason) == HALT_WFE) {
+             qemu_cpu_kick(cs);
+         }
+     }
+ }

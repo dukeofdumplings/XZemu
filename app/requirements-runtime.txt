@@ -1,0 +1,3 @@
+# Local runtime-builder dependencies.  Kept separate from QEMU's own Python
+# tooling so the macOS launcher can use an isolated virtual environment.
+cryptography>=44
